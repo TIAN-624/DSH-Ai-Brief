@@ -211,10 +211,218 @@ function uniq(list) {
   return out
 }
 
+/** 早报/晚报标签。不在表内的标签落到「热点」，不采用模型自造分类。 */
+export const BRIEF_TAGS = ['模型', '应用', '财报', '融资', '政策', '芯片', '人物', '热点']
+/** 论坛速报标签。 */
+export const FORUM_TAGS = ['校园', '生活', '吐槽', '情感', '消费', '学习', '热点', '求助']
+
+const JSON_TEXT_LIMIT = 200_000
+const JSON_OBJECT_LIMIT = 8
+
+function clampInt(value, min, max, fallback) {
+  const n = Number(value)
+  if (!Number.isInteger(n)) return fallback
+  if (n < min) return min
+  if (n > max) return max
+  return n
+}
+
+/** 只认 1..itemCount 的整数序号。字符串必须是不带符号、不带前导零的十进制。 */
+export function canonicalPickId(value, itemCount) {
+  if (!Number.isInteger(itemCount) || itemCount < 1) return null
+  let n = null
+  if (typeof value === 'number') {
+    if (!Number.isInteger(value)) return null
+    n = value
+  } else if (typeof value === 'string') {
+    const t = value.trim()
+    if (!/^[1-9]\d{0,3}$/.test(t)) return null
+    n = Number(t)
+  } else return null
+  if (n < 1 || n > itemCount) return null
+  return n
+}
+
+/**
+ * 顶层 `{...}` 切片。字符串里的括号不算；外层没闭合时整段丢弃，不把截断内容里的内层对象当成成功。
+ * 只切片，不执行、不修补模型文本。
+ */
+export function topLevelJsonObjects(text) {
+  const s = String(text ?? '').slice(0, JSON_TEXT_LIMIT)
+  const out = []
+  let depth = 0
+  let inStr = false
+  let esc = false
+  let start = -1
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (inStr) {
+      if (esc) { esc = false; continue }
+      if (c === '\\') { esc = true; continue }
+      if (c === '"') inStr = false
+      continue
+    }
+    if (c === '"') { inStr = true; continue }
+    if (c === '{') {
+      if (depth === 0) start = i
+      depth++
+      continue
+    }
+    if (c === '}') {
+      if (depth === 0) continue
+      depth--
+      if (depth === 0 && start >= 0) {
+        out.push(s.slice(start, i + 1))
+        start = -1
+        if (out.length >= JSON_OBJECT_LIMIT) break
+      }
+    }
+  }
+  return out
+}
+
+/** 只认行首围栏。行中间的 ```（吐槽里常见）不当成围栏，避免把合法 JSON 整段丢掉。 */
+function fenceBodies(text) {
+  const lines = String(text ?? '').slice(0, JSON_TEXT_LIMIT).split(/\r?\n/)
+  const out = []
+  for (let i = 0; i < lines.length; i++) {
+    const open = lines[i].match(/^[ \t]{0,3}(`{3,}|~{3,})(.*)$/)
+    if (!open) continue
+    const marker = open[1]
+    const rest = open[2]
+    // 同一行收口时用最后一处标记，避免吐槽字符串里的 ``` 被当成结束。
+    const inlineClose = rest.lastIndexOf(marker)
+    if (inlineClose !== -1) {
+      out.push(rest.slice(0, inlineClose))
+    } else {
+      const body = []
+      let closed = false
+      for (let k = i + 1; k < lines.length; k++) {
+        const close = lines[k].match(/^[ \t]{0,3}(`{3,}|~{3,})[ \t]*$/)
+        if (close && close[1][0] === marker[0] && close[1].length >= marker.length) {
+          closed = true
+          i = k
+          break
+        }
+        body.push(lines[k])
+      }
+      if (closed) out.push(body.join('\n'))
+    }
+    if (out.length >= JSON_OBJECT_LIMIT) break
+  }
+  return out
+}
+
+/**
+ * 有围栏时只取围栏内的对象，围栏是坏的就失败，不用正文里另一个对象把坏输出洗成成功。
+ * 没有围栏时按出现顺序取顶层对象。
+ */
+export function jsonObjectCandidates(text) {
+  const fences = fenceBodies(text)
+  if (fences.length) {
+    const out = []
+    for (const body of fences) {
+      for (const obj of topLevelJsonObjects(body)) {
+        out.push(obj)
+        if (out.length >= JSON_OBJECT_LIMIT) return out
+      }
+    }
+    return out
+  }
+  return topLevelJsonObjects(text)
+}
+
+function judgePicks(value, opt) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return { ok: false, reason: 'JSON 结构无效：顶层不是对象' }
+  }
+  if (!Array.isArray(value.picks)) return { ok: false, reason: 'JSON 结构无效：picks 不是数组' }
+  const maxPicks = clampInt(opt.maxPicks, 1, 8, 5)
+  const tags = Array.isArray(opt.tags) && opt.tags.length ? opt.tags : BRIEF_TAGS
+  const defaultTag = tags.includes(opt.defaultTag) ? opt.defaultTag : (tags.includes('热点') ? '热点' : tags[0])
+  const commentMax = clampInt(opt.commentMax, 0, 80, 24)
+  const tomorrowMax = clampInt(opt.tomorrowMax, 0, 200, 40)
+  const seen = new Set()
+  const picks = []
+  for (const p of value.picks) {
+    if (!p || typeof p !== 'object' || Array.isArray(p)) continue
+    const id = canonicalPickId(p.id, opt.itemCount)
+    if (id == null || seen.has(id)) continue
+    seen.add(id)
+    const tagRaw = typeof p.tag === 'string' ? p.tag.trim() : ''
+    const tag = tags.includes(tagRaw) ? tagRaw : defaultTag
+    const comment = typeof p.comment === 'string' ? p.comment.slice(0, commentMax) : ''
+    picks.push({ id, tag, comment })
+    if (picks.length >= maxPicks) break
+  }
+  if (!picks.length) {
+    return { ok: false, reason: value.picks.length ? 'JSON 结构无效：没有落在候选范围内的序号' : 'JSON 结构无效：picks 为空' }
+  }
+  const tomorrow = typeof value.tomorrow === 'string' ? value.tomorrow.slice(0, tomorrowMax) : ''
+  return { ok: true, picks, tomorrow }
+}
+
+/**
+ * 取第一个「能 JSON.parse 且序号落在候选内」的对象。
+ * 语法错误不修补；失败时尽量带回最长那段的 JSON.parse 原文，方便日志对上「position N」。
+ */
+export function resolveIndexedPicks(text, options = {}) {
+  const candidates = jsonObjectCandidates(text)
+  const parseErrors = []
+  const schemaErrors = []
+  for (const slice of candidates) {
+    let value
+    try { value = JSON.parse(slice) }
+    catch (e) {
+      parseErrors.push({ len: slice.length, error: String(e?.message || e) })
+      continue
+    }
+    const judged = judgePicks(value, options)
+    if (judged.ok) return { ok: true, picks: judged.picks, tomorrow: judged.tomorrow, error: '' }
+    schemaErrors.push(judged.reason)
+  }
+  let error = '模型输出没有完整 JSON 对象'
+  if (parseErrors.length) {
+    parseErrors.sort((a, b) => b.len - a.len)
+    error = parseErrors[0].error
+  } else if (schemaErrors.length) error = schemaErrors[0]
+  return { ok: false, picks: [], tomorrow: '', error }
+}
+
+/** 成功时标题/链接只来自 items[id-1]；失败时按原顺序用源标题兜底，吐槽留空。 */
+export function takeBriefSelection(text, items, options = {}) {
+  const list = Array.isArray(items) ? items : []
+  const maxPicks = clampInt(options.maxPicks, 1, 8, 5)
+  const tags = Array.isArray(options.tags) && options.tags.length ? options.tags : BRIEF_TAGS
+  const defaultTag = tags.includes(options.defaultTag) ? options.defaultTag : (tags.includes('热点') ? '热点' : tags[0])
+  const resolved = resolveIndexedPicks(text, {
+    itemCount: list.length,
+    maxPicks,
+    tags,
+    defaultTag,
+    commentMax: options.commentMax,
+    tomorrowMax: options.tomorrowMax,
+  })
+  if (!resolved.ok) {
+    return {
+      fallback: true,
+      error: resolved.error,
+      tomorrow: '',
+      picks: list.slice(0, maxPicks).map((item) => ({ item, tag: defaultTag, comment: '' })),
+    }
+  }
+  return {
+    fallback: false,
+    error: '',
+    tomorrow: resolved.tomorrow,
+    picks: resolved.picks.map((p) => ({ item: list[p.id - 1], tag: p.tag, comment: p.comment })),
+  }
+}
+
 export default {
   id: 'ai-brief',
   name: 'AI 新闻推送',
-  version: '2.2.1',
+  version: '2.2.2',
   api: 1,
   description: '每天早晚 AI 简报（Bing 新闻 + 知乎热榜 + 热榜）+ 中午论坛速报（腾讯频道校园论坛热帖），带链接和她的一句吐槽',
   panel: 'panel.js',
@@ -507,15 +715,9 @@ export default {
           maxTokens: 900,
           temperature: 0.7,
         })
-        const m = String(out).match(/\{[\s\S]*\}/)
-        const j = m ? JSON.parse(m[0]) : null
-        const TAGS = ['校园', '生活', '吐槽', '情感', '消费', '学习', '热点', '求助']
-        if (j && Array.isArray(j.picks)) {
-          picks = j.picks
-            .map((p) => ({ d: top[Number(p.id) - 1], tag: TAGS.includes(String(p.tag || '').trim()) ? String(p.tag).trim() : '热点', comment: String(p.comment || '').slice(0, 24) }))
-            .filter((p) => p.d)
-            .slice(0, n)
-        }
+        const sel = takeBriefSelection(out, top, { maxPicks: n, tags: FORUM_TAGS, defaultTag: '热点' })
+        if (sel.fallback) api.log?.warn?.('论坛速报提炼失败：' + sel.error)
+        picks = sel.picks.map((p) => ({ d: p.item, tag: p.tag, comment: p.comment }))
       } catch (e) { api.log?.warn?.('论坛速报提炼失败：' + (e?.message || e)) }
       if (!picks.length) picks = top.slice(0, n).map((d) => ({ d, tag: '热点', comment: '' }))
       return { picks }
@@ -604,20 +806,10 @@ export default {
           maxTokens: 1400,
           temperature: 0.6,
         })
-        const m = String(out).match(/\{[\s\S]*\}/)
-        const j = m ? JSON.parse(m[0]) : null
-        if (j && Array.isArray(j.picks)) {
-          const TAGS = ['模型', '应用', '财报', '融资', '政策', '芯片', '人物', '热点']
-          picks = j.picks
-            .map((p) => ({
-              item: top[Number(p.id) - 1],
-              comment: String(p.comment || '').slice(0, 24),
-              tag: TAGS.includes(String(p.tag || '').trim()) ? String(p.tag).trim() : '热点',
-            }))
-            .filter((p) => p.item)
-            .slice(0, n)
-          tomorrow = String(j.tomorrow || '').slice(0, 40)
-        }
+        const sel = takeBriefSelection(out, top, { maxPicks: n, tags: BRIEF_TAGS, defaultTag: '热点' })
+        if (sel.fallback) api.log?.warn?.('早报提炼失败，用原始标题：' + sel.error)
+        picks = sel.picks
+        tomorrow = sel.tomorrow
       } catch (e) { api.log?.warn?.('早报提炼失败，用原始标题：' + (e?.message || e)) }
       if (!picks.length) picks = top.slice(0, n).map((item) => ({ item, comment: '', tag: '热点' }))
 
